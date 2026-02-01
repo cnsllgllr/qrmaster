@@ -37,7 +37,7 @@ class QRRecord(db.Model):
             'createdAt': self.created_at,
             'reportTitle': self.report_title,
             'reportNote': self.report_note,
-            'reportFile': f"http://localhost:5000/uploads/{self.report_file}" if self.report_file else None,
+            'reportFile': f"{request.host_url}uploads/{self.report_file}" if self.report_file else None,
             'fileName': self.file_name
         }
 
