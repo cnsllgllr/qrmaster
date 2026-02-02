@@ -133,7 +133,17 @@ def create_folder():
     result['qrCount'] = 0
     return jsonify(result), 201
 
-# Recursive helper to delete folder and all children
+# Helper: Get all descendant batch IDs including self (Recursive)
+def get_all_batch_ids_recursive(batch_id):
+    ids = [batch_id]
+    # Fetch immediate children of this batch
+    children = Batch.query.filter_by(parent_id=batch_id).all()
+    for child in children:
+        # Recursively fetch children's descendants
+        ids.extend(get_all_batch_ids_recursive(child.id))
+    return ids
+
+# Helper: Delete folder and all children recursively
 def delete_folder_recursive(batch_id):
     # 1. Find all children
     children = Batch.query.filter_by(parent_id=batch_id).all()
@@ -172,9 +182,19 @@ def delete_folder(batch_id):
 @app.route('/api/qrs', methods=['GET'])
 def get_qrs():
     batch_id = request.args.get('batchId')
+    batch_ids_param = request.args.get('batchIds')
+    
     query = QRRecord.query
-    if batch_id:
-        query = query.filter_by(batch_id=batch_id)
+    
+    if batch_ids_param:
+        # Multi-select filtering: Frontend sends comma-separated list of IDs to include
+        ids_list = batch_ids_param.split(',')
+        query = query.filter(QRRecord.batch_id.in_(ids_list))
+    elif batch_id:
+        # Fallback / Single-select legacy: Get list of ALL IDs (Self + All Descendants)
+        all_related_ids = get_all_batch_ids_recursive(batch_id)
+        query = query.filter(QRRecord.batch_id.in_(all_related_ids))
+        
     records = query.order_by(QRRecord.created_at.desc()).all()
     return jsonify([r.to_dict() for r in records])
 
