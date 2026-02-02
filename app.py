@@ -51,7 +51,7 @@ class QRRecord(db.Model):
             'createdAt': self.created_at,
             'reportTitle': self.report_title,
             'reportNote': self.report_note,
-            'reportFile': f"http://localhost:5000/uploads/{self.report_file}" if self.report_file else None,
+            'reportFile': f"{request.host_url}uploads/{self.report_file}" if self.report_file else None,
             'fileName': self.file_name
         }
 
@@ -298,4 +298,4 @@ def delete_folder(batch_id):
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(host="0.0.0.0", port=5000)
