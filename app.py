@@ -3,7 +3,9 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from sqlalchemy import func
 import time
+import uuid
 
 app = Flask(__name__)
 CORS(app) # Enable CORS for frontend communication
@@ -21,9 +23,21 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 db = SQLAlchemy(app)
 
 # --- Models ---
+class Batch(db.Model):
+    id = db.Column(db.String(36), primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    created_at = db.Column(db.Integer, nullable=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'createdAt': self.created_at
+        }
+
 class QRRecord(db.Model):
     id = db.Column(db.String(36), primary_key=True)
-    batch_id = db.Column(db.String(36), nullable=False, index=True) # Added index for faster deletions
+    batch_id = db.Column(db.String(36), db.ForeignKey('batch.id'), nullable=False, index=True) 
     created_at = db.Column(db.Integer, nullable=False) # Timestamp
     report_title = db.Column(db.String(200), nullable=True)
     report_note = db.Column(db.Text, nullable=True)
@@ -37,7 +51,7 @@ class QRRecord(db.Model):
             'createdAt': self.created_at,
             'reportTitle': self.report_title,
             'reportNote': self.report_note,
-            'reportFile': f"{request.host_url}uploads/{self.report_file}" if self.report_file else None,
+            'reportFile': f"http://localhost:5000/uploads/{self.report_file}" if self.report_file else None,
             'fileName': self.file_name
         }
 
@@ -52,23 +66,80 @@ with app.app_context():
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-# 3. Auth (Simple Mock for now to match existing frontend logic)
+# 3. Auth
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.json
     username = data.get('username')
     password = data.get('password')
-    # Hardcoded for now, can be moved to DB later
     if username == 'admin' and password == '1234':
         return jsonify({'success': True})
     return jsonify({'success': False, 'message': 'Invalid credentials'}), 401
 
-# 4. GET All QRs
+# --- FOLDER (BATCH) MANAGEMENT ---
+
+@app.route('/api/folders', methods=['GET'])
+def get_folders():
+    # Fetch batches with a count of their QRs
+    # Subquery to count QRs per batch
+    qr_counts = db.session.query(
+        QRRecord.batch_id, 
+        func.count(QRRecord.id).label('count')
+    ).group_by(QRRecord.batch_id).subquery()
+
+    # Join Batch with counts
+    results = db.session.query(Batch, qr_counts.c.count)\
+        .outerjoin(qr_counts, Batch.id == qr_counts.c.batch_id)\
+        .order_by(Batch.created_at.desc())\
+        .all()
+
+    folders = []
+    for batch, count in results:
+        b_dict = batch.to_dict()
+        b_dict['qrCount'] = count if count else 0
+        folders.append(b_dict)
+    
+    return jsonify(folders)
+
+@app.route('/api/folders', methods=['POST'])
+def create_folder():
+    data = request.json
+    name = data.get('name')
+    
+    # Generate default name if empty
+    created_at = int(time.time() * 1000)
+    if not name or name.strip() == "":
+        import datetime
+        dt_object = datetime.datetime.fromtimestamp(created_at / 1000)
+        name = dt_object.strftime("%d %B %Y %H:%M") # e.g. 10 October 2023 14:30
+
+    new_batch = Batch(
+        id=str(uuid.uuid4()),
+        name=name,
+        created_at=created_at
+    )
+    
+    db.session.add(new_batch)
+    db.session.commit()
+    
+    # Return with initial count 0
+    result = new_batch.to_dict()
+    result['qrCount'] = 0
+    return jsonify(result), 201
+
+# --- QR MANAGEMENT ---
+
+# 4. GET QRs (Filtered by Batch ID)
 @app.route('/api/qrs', methods=['GET'])
 def get_qrs():
-    # Optimization: Use yield_per if data is massive, but for now standard fetch is okay
-    # Limiting fields in query could also be an optimization if needed later
-    records = QRRecord.query.order_by(QRRecord.created_at.desc()).all()
+    batch_id = request.args.get('batchId')
+    
+    query = QRRecord.query
+    
+    if batch_id:
+        query = query.filter_by(batch_id=batch_id)
+        
+    records = query.order_by(QRRecord.created_at.desc()).all()
     return jsonify([r.to_dict() for r in records])
 
 # 5. GET Single QR
@@ -79,11 +150,17 @@ def get_qr(id):
         return jsonify(record.to_dict())
     return jsonify({'error': 'Not found'}), 404
 
-# 6. Create Batch (POST)
+# 6. Create Batch (POST) - Adds QRs to an EXISTING batch
 @app.route('/api/qrs/batch', methods=['POST'])
-def create_batch():
+def create_qr_batch():
     data = request.json
-    # Optimization: Use bulk_insert_mappings for massive inserts
+    if not data:
+        return jsonify({'error': 'No data'}), 400
+        
+    # Validation: Ensure batch exists (optional but good practice)
+    # batch_id = data[0]['batchId']
+    
+    # Optimization: Use bulk_insert_mappings
     if len(data) > 1000:
         db.session.bulk_insert_mappings(QRRecord, [
             {
@@ -108,14 +185,13 @@ def create_batch():
     db.session.commit()
     return jsonify({'success': True, 'count': len(data)}), 201
 
-# 7. Update Record (Upload Report)
+# 7. Update Record
 @app.route('/api/qrs/<id>', methods=['PUT'])
 def update_qr(id):
     record = QRRecord.query.get(id)
     if not record:
         return jsonify({'error': 'Not found'}), 404
 
-    # Handle Multipart Form Data (File Upload)
     if 'file' in request.files:
         file = request.files['file']
         if file.filename != '':
@@ -123,22 +199,19 @@ def update_qr(id):
             file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             file.save(file_path)
             
-            # Remove old file if exists
             if record.report_file:
                 old_path = os.path.join(app.config['UPLOAD_FOLDER'], record.report_file)
                 if os.path.exists(old_path):
                     os.remove(old_path)
             
             record.report_file = filename
-            record.file_name = file.filename # Original name
+            record.file_name = file.filename
 
-    # Handle Text Data
     if 'reportTitle' in request.form:
         record.report_title = request.form['reportTitle']
     if 'reportNote' in request.form:
         record.report_note = request.form['reportNote']
     
-    # Allow removing file via flag
     if request.form.get('removeFile') == 'true':
          if record.report_file:
                 old_path = os.path.join(app.config['UPLOAD_FOLDER'], record.report_file)
@@ -172,28 +245,22 @@ def delete_report(id):
     db.session.commit()
     return jsonify(record.to_dict())
 
-# 9. Bulk Delete Records (OPTIMIZED)
+# 9. Bulk Delete Records
 @app.route('/api/qrs/bulk-delete', methods=['POST'])
 def delete_records():
     ids = request.json.get('ids', [])
     if not ids:
         return jsonify({'success': True, 'deleted_count': 0})
 
-    # 1. Clean up files first (Only fetch records that actually have files)
-    # This prevents loading 100k objects into memory just to check if they have a file
     records_with_files = QRRecord.query.filter(QRRecord.id.in_(ids)).filter(QRRecord.report_file.isnot(None)).all()
-    
     for r in records_with_files:
         try:
             path = os.path.join(app.config['UPLOAD_FOLDER'], r.report_file)
             if os.path.exists(path):
                 os.remove(path)
         except Exception:
-            pass # Continue even if file deletion fails
+            pass
 
-    # 2. Bulk Database Delete
-    # Synchronize session not needed for massive delete usually, 'fetch' is safer for cascade but slower. 
-    # For speed with 100k records, simple delete is best.
     try:
         delete_q = QRRecord.__table__.delete().where(QRRecord.id.in_(ids))
         db.session.execute(delete_q)
@@ -204,11 +271,10 @@ def delete_records():
 
     return jsonify({'success': True})
 
-# 10. Delete Entire Batch (NEW - HIGHLY OPTIMIZED)
-@app.route('/api/qrs/batch/<batch_id>', methods=['DELETE'])
-def delete_batch(batch_id):
+# 10. Delete Entire Folder (Batch)
+@app.route('/api/folders/<batch_id>', methods=['DELETE'])
+def delete_folder(batch_id):
     # 1. Cleanup files for this batch
-    # Only fetch records with files to save memory
     records_with_files = QRRecord.query.filter_by(batch_id=batch_id).filter(QRRecord.report_file.isnot(None)).all()
     
     for r in records_with_files:
@@ -219,9 +285,12 @@ def delete_batch(batch_id):
         except Exception:
             pass
 
-    # 2. SQL Bulk Delete by Batch ID
+    # 2. Delete QR Records
     try:
         QRRecord.query.filter_by(batch_id=batch_id).delete()
+        # 3. Delete Batch Record
+        Batch.query.filter_by(id=batch_id).delete()
+        
         db.session.commit()
         return jsonify({'success': True})
     except Exception as e:
@@ -229,4 +298,4 @@ def delete_batch(batch_id):
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True, port=5000)
