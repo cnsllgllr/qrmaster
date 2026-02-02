@@ -26,12 +26,18 @@ db = SQLAlchemy(app)
 class Batch(db.Model):
     id = db.Column(db.String(36), primary_key=True)
     name = db.Column(db.String(100), nullable=False)
+    parent_id = db.Column(db.String(36), db.ForeignKey('batch.id'), nullable=True)
     created_at = db.Column(db.Integer, nullable=False)
+    
+    # Relationship to fetch children easily if needed, 
+    # but we will mostly handle hierarchy logic in application code or flattened fetch
+    children = db.relationship('Batch', backref=db.backref('parent', remote_side=[id]))
 
     def to_dict(self):
         return {
             'id': self.id,
             'name': self.name,
+            'parentId': self.parent_id,
             'createdAt': self.created_at
         }
 
@@ -105,44 +111,73 @@ def get_folders():
 def create_folder():
     data = request.json
     name = data.get('name')
+    parent_id = data.get('parentId') # Optional parent ID
     
-    # Generate default name if empty
     created_at = int(time.time() * 1000)
     if not name or name.strip() == "":
         import datetime
         dt_object = datetime.datetime.fromtimestamp(created_at / 1000)
-        name = dt_object.strftime("%d %B %Y %H:%M") # e.g. 10 October 2023 14:30
+        name = dt_object.strftime("%d %B %Y %H:%M")
 
     new_batch = Batch(
         id=str(uuid.uuid4()),
         name=name,
+        parent_id=parent_id,
         created_at=created_at
     )
     
     db.session.add(new_batch)
     db.session.commit()
     
-    # Return with initial count 0
     result = new_batch.to_dict()
     result['qrCount'] = 0
     return jsonify(result), 201
 
+# Recursive helper to delete folder and all children
+def delete_folder_recursive(batch_id):
+    # 1. Find all children
+    children = Batch.query.filter_by(parent_id=batch_id).all()
+    for child in children:
+        delete_folder_recursive(child.id)
+    
+    # 2. Delete files for QRs in THIS batch
+    records_with_files = QRRecord.query.filter_by(batch_id=batch_id).filter(QRRecord.report_file.isnot(None)).all()
+    for r in records_with_files:
+        try:
+            path = os.path.join(app.config['UPLOAD_FOLDER'], r.report_file)
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
+    # 3. Delete QR Records in THIS batch
+    QRRecord.query.filter_by(batch_id=batch_id).delete()
+    
+    # 4. Delete THIS batch
+    Batch.query.filter_by(id=batch_id).delete()
+
+# 10. Delete Entire Folder (Batch) - Recursive
+@app.route('/api/folders/<batch_id>', methods=['DELETE'])
+def delete_folder(batch_id):
+    try:
+        delete_folder_recursive(batch_id)
+        db.session.commit()
+        return jsonify({'success': True})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
 # --- QR MANAGEMENT ---
 
-# 4. GET QRs (Filtered by Batch ID)
 @app.route('/api/qrs', methods=['GET'])
 def get_qrs():
     batch_id = request.args.get('batchId')
-    
     query = QRRecord.query
-    
     if batch_id:
         query = query.filter_by(batch_id=batch_id)
-        
     records = query.order_by(QRRecord.created_at.desc()).all()
     return jsonify([r.to_dict() for r in records])
 
-# 5. GET Single QR
 @app.route('/api/qrs/<id>', methods=['GET'])
 def get_qr(id):
     record = QRRecord.query.get(id)
@@ -150,17 +185,11 @@ def get_qr(id):
         return jsonify(record.to_dict())
     return jsonify({'error': 'Not found'}), 404
 
-# 6. Create Batch (POST) - Adds QRs to an EXISTING batch
 @app.route('/api/qrs/batch', methods=['POST'])
 def create_qr_batch():
     data = request.json
-    if not data:
-        return jsonify({'error': 'No data'}), 400
-        
-    # Validation: Ensure batch exists (optional but good practice)
-    # batch_id = data[0]['batchId']
+    if not data: return jsonify({'error': 'No data'}), 400
     
-    # Optimization: Use bulk_insert_mappings
     if len(data) > 1000:
         db.session.bulk_insert_mappings(QRRecord, [
             {
@@ -185,12 +214,10 @@ def create_qr_batch():
     db.session.commit()
     return jsonify({'success': True, 'count': len(data)}), 201
 
-# 7. Update Record
 @app.route('/api/qrs/<id>', methods=['PUT'])
 def update_qr(id):
     record = QRRecord.query.get(id)
-    if not record:
-        return jsonify({'error': 'Not found'}), 404
+    if not record: return jsonify({'error': 'Not found'}), 404
 
     if 'file' in request.files:
         file = request.files['file']
@@ -201,22 +228,18 @@ def update_qr(id):
             
             if record.report_file:
                 old_path = os.path.join(app.config['UPLOAD_FOLDER'], record.report_file)
-                if os.path.exists(old_path):
-                    os.remove(old_path)
+                if os.path.exists(old_path): os.remove(old_path)
             
             record.report_file = filename
             record.file_name = file.filename
 
-    if 'reportTitle' in request.form:
-        record.report_title = request.form['reportTitle']
-    if 'reportNote' in request.form:
-        record.report_note = request.form['reportNote']
+    if 'reportTitle' in request.form: record.report_title = request.form['reportTitle']
+    if 'reportNote' in request.form: record.report_note = request.form['reportNote']
     
     if request.form.get('removeFile') == 'true':
          if record.report_file:
                 old_path = os.path.join(app.config['UPLOAD_FOLDER'], record.report_file)
-                if os.path.exists(old_path):
-                    os.remove(old_path)
+                if os.path.exists(old_path): os.remove(old_path)
          record.report_file = None
          record.file_name = None
          record.report_title = None
@@ -225,41 +248,33 @@ def update_qr(id):
     db.session.commit()
     return jsonify(record.to_dict())
 
-# 8. Delete Report Only
 @app.route('/api/qrs/<id>/report', methods=['DELETE'])
 def delete_report(id):
     record = QRRecord.query.get(id)
-    if not record:
-        return jsonify({'error': 'Not found'}), 404
+    if not record: return jsonify({'error': 'Not found'}), 404
     
     if record.report_file:
         old_path = os.path.join(app.config['UPLOAD_FOLDER'], record.report_file)
-        if os.path.exists(old_path):
-            os.remove(old_path)
+        if os.path.exists(old_path): os.remove(old_path)
     
     record.report_file = None
     record.file_name = None
     record.report_title = None
     record.report_note = None
-    
     db.session.commit()
     return jsonify(record.to_dict())
 
-# 9. Bulk Delete Records
 @app.route('/api/qrs/bulk-delete', methods=['POST'])
 def delete_records():
     ids = request.json.get('ids', [])
-    if not ids:
-        return jsonify({'success': True, 'deleted_count': 0})
+    if not ids: return jsonify({'success': True, 'deleted_count': 0})
 
     records_with_files = QRRecord.query.filter(QRRecord.id.in_(ids)).filter(QRRecord.report_file.isnot(None)).all()
     for r in records_with_files:
         try:
             path = os.path.join(app.config['UPLOAD_FOLDER'], r.report_file)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
+            if os.path.exists(path): os.remove(path)
+        except Exception: pass
 
     try:
         delete_q = QRRecord.__table__.delete().where(QRRecord.id.in_(ids))
@@ -270,32 +285,6 @@ def delete_records():
         return jsonify({'error': str(e)}), 500
 
     return jsonify({'success': True})
-
-# 10. Delete Entire Folder (Batch)
-@app.route('/api/folders/<batch_id>', methods=['DELETE'])
-def delete_folder(batch_id):
-    # 1. Cleanup files for this batch
-    records_with_files = QRRecord.query.filter_by(batch_id=batch_id).filter(QRRecord.report_file.isnot(None)).all()
-    
-    for r in records_with_files:
-        try:
-            path = os.path.join(app.config['UPLOAD_FOLDER'], r.report_file)
-            if os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
-
-    # 2. Delete QR Records
-    try:
-        QRRecord.query.filter_by(batch_id=batch_id).delete()
-        # 3. Delete Batch Record
-        Batch.query.filter_by(id=batch_id).delete()
-        
-        db.session.commit()
-        return jsonify({'success': True})
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=5000)
